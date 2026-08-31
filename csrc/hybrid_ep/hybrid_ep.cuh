@@ -26,12 +26,13 @@ public:
   ~HybridEPBuffer();
   bool update_buffer(HybridEpConfigInstance config); // True means the buffer is reallocated.
 
-  HandleImpl metadata_preprocessing(HybridEpConfigInstance config, 
-    torch::Tensor local_routing_map, 
-    int64_t num_of_tokens_per_rank, 
-    c10::optional<int64_t> num_permuted_tokens, 
-    c10::optional<int64_t> pad_multiple, 
-    bool enable_permute, 
+  HandleImpl metadata_preprocessing(HybridEpConfigInstance config,
+    torch::Tensor local_routing_map,
+    int64_t num_of_tokens_per_rank,
+    c10::optional<int64_t> num_of_valid_tokens,
+    c10::optional<int64_t> num_permuted_tokens,
+    c10::optional<int64_t> pad_multiple,
+    bool enable_permute,
     bool fuse_permute_dispatch,
     bool non_blocking
   );

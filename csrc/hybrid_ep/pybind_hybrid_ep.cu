@@ -162,6 +162,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("num_dispatched_tokens_tensor", &HandleImpl::num_dispatched_tokens_tensor)
         .def_readwrite("local_expert_routing_map", &HandleImpl::local_expert_routing_map)
         .def_readwrite("num_of_tokens_per_rank", &HandleImpl::num_of_tokens_per_rank)
+        .def_readwrite("num_of_valid_tokens", &HandleImpl::num_of_valid_tokens)
         .def_readwrite("config", &HandleImpl::config)
         .def_readwrite("tokens_per_expert", &HandleImpl::tokens_per_expert)
         .def_readwrite("padded_tokens_per_expert", &HandleImpl::padded_tokens_per_expert)
@@ -187,6 +188,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("config"),
              py::arg("routing_map"),
              py::arg("num_of_tokens_per_rank"),
+             py::arg("num_of_valid_tokens") = std::nullopt,
              py::arg("num_permuted_tokens") = std::nullopt,
              py::arg("pad_multiple") = std::nullopt,
              py::arg("enable_permute") = false,

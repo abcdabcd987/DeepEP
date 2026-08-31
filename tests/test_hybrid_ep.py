@@ -182,7 +182,7 @@ def test_hybrid_ep_correctness(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, us
                 masked_probs[:, start:end] = dispatched_probs_dense[:, start:end]
                 dispatched_probs_dense = masked_probs
 
-            _, _, _, num_dispatched_tokens, local_expert_routing_map, _, _ = handle_dense
+            num_dispatched_tokens, local_expert_routing_map = handle_dense[3], handle_dense[4]
             num_dispatched_tokens = num_dispatched_tokens.cpu()
             local_expert_routing_map = local_expert_routing_map[
                 : num_dispatched_tokens.item()

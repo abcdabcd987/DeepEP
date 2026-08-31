@@ -132,10 +132,14 @@ bool HybridEPBuffer::update_buffer(HybridEpConfigInstance config) {
   return need_reallocate;
 }
 
-HandleImpl HybridEPBuffer::metadata_preprocessing(HybridEpConfigInstance config, torch::Tensor local_routing_map, int64_t num_of_tokens_per_rank, c10::optional<int64_t> num_permuted_tokens, c10::optional<int64_t> pad_multiple, bool enable_permute, bool fuse_permute_dispatch, bool non_blocking) {
+HandleImpl HybridEPBuffer::metadata_preprocessing(HybridEpConfigInstance config, torch::Tensor local_routing_map, int64_t num_of_tokens_per_rank, c10::optional<int64_t> num_of_valid_tokens, c10::optional<int64_t> num_permuted_tokens, c10::optional<int64_t> pad_multiple, bool enable_permute, bool fuse_permute_dispatch, bool non_blocking) {
   // Basic checks
   assert(local_routing_map.device().is_cuda());
   assert(local_routing_map.is_contiguous());
+  TORCH_CHECK(local_routing_map.size(0) == num_of_tokens_per_rank,
+              "local_routing_map has ", local_routing_map.size(0),
+              " rows but num_of_tokens_per_rank is ", num_of_tokens_per_rank,
+              "; pad the routing data to the group-uniform token-slot count");
   if(fuse_permute_dispatch) {
     assert(enable_permute);
   }
@@ -147,11 +151,12 @@ HandleImpl HybridEPBuffer::metadata_preprocessing(HybridEpConfigInstance config,
 
   // Run the hybrid-ep metadata preprocessing kernel
   auto handle = executor.metadata_preprocess_core(
-    config, 
-    nvl_coordinator.preprocessing_tmp, 
+    config,
+    nvl_coordinator.preprocessing_tmp,
     nvl_coordinator.preprocessing_local_experts_tmp,
-    global_routing_map, 
-    num_of_tokens_per_rank, 
+    global_routing_map,
+    num_of_tokens_per_rank,
+    num_of_valid_tokens.has_value() ? num_of_valid_tokens.value() : -1,
     num_permuted_tokens.has_value() ? num_permuted_tokens.value() : -1,
     pad_multiple.has_value() ? pad_multiple.value() : 0,
     enable_permute,
@@ -233,7 +238,11 @@ HybridEPBuffer::combine(
            probs.value().size(1) == config.num_of_experts_per_rank * config.num_of_ranks_per_node);
   }
 
-  // Construct the output tensors
+  // Construct the output tensors. The combine kernel writes every token slot
+  // in [0, num_of_tokens_per_rank), so the buffers are allocated at the
+  // group-uniform slot count; the returned views are narrowed to the real
+  // local token count.
+  const int64_t num_of_valid_tokens = handle.valid_token_count();
   torch::Tensor combined_tokens, combined_probs;
   combined_tokens =torch::empty({handle.num_of_tokens_per_rank, config.hidden_dim},
                    torch::dtype(hidden.dtype()).device(torch::kCUDA));
@@ -260,7 +269,11 @@ HybridEPBuffer::combine(
   executor.combine_preprocess(config, args);
   executor.combine_core(config, args);
   executor.combine_postprocess(config, args);
-  
+
+  if (num_of_valid_tokens != handle.num_of_tokens_per_rank) {
+    combined_tokens = combined_tokens.narrow(0, 0, num_of_valid_tokens);
+    if (with_probs) combined_probs = combined_probs.narrow(0, 0, num_of_valid_tokens);
+  }
   return std::make_tuple(combined_tokens, combined_probs);
 }
 
@@ -356,7 +369,10 @@ HybridEPBuffer::combine_with_unpermute(
     assert(probs.value().dtype() == torch::kFloat32);
   }
 
-  // Construct the output tensors
+  // Construct the output tensors. See combine(): allocate at the group-uniform
+  // slot count (the kernel writes every slot), return views narrowed to the
+  // real local token count.
+  const int64_t num_of_valid_tokens = handle.valid_token_count();
   torch::Tensor combined_tokens, combined_probs;
   combined_tokens =torch::empty({handle.num_of_tokens_per_rank, config.hidden_dim},
                    torch::dtype(hidden.dtype()).device(torch::kCUDA));
@@ -386,6 +402,10 @@ HybridEPBuffer::combine_with_unpermute(
   executor.combine_preprocess(config, args);
   executor.combine_core(config, args);
   executor.combine_postprocess(config, args);
-  
+
+  if (num_of_valid_tokens != handle.num_of_tokens_per_rank) {
+    combined_tokens = combined_tokens.narrow(0, 0, num_of_valid_tokens);
+    if (with_probs) combined_probs = combined_probs.narrow(0, 0, num_of_valid_tokens);
+  }
   return std::make_tuple(combined_tokens, combined_probs);
 }

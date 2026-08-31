@@ -714,8 +714,13 @@ inline __device__ void N2N_warp_group_device_function(const int node_rank,
   static_assert(INTER_NODE_GROUP::size() == 32, "INTER_NODE_GROUP should be 1 warp.");
 
   const int NUM_OF_CHUNKS_PER_RANK = (num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK + 1;
+  // The receiver polls flags at the MAX-based stride (see G2S warp group), so
+  // the per-sender tile stride in the flag buffer must also be MAX-based —
+  // using the runtime chunk count here would misplace flags whenever the
+  // runtime count differs from the template max.
+  constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = (MAX_NUM_OF_TOKENS_PER_RANK - 1) / NUM_OF_TOKENS_PER_CHUNK + 1;
   bool *smem_attn_to_rdma_map_ptr = smem_buffer_ptr->attn_to_rdma_map_buffer;
-  
+
   const size_t local_stride = nixl_ctx->local_mvh_stride;
   const size_t remote_stride = nixl_ctx->remote_data_mvh_stride;
 
@@ -732,7 +737,7 @@ inline __device__ void N2N_warp_group_device_function(const int node_rank,
       const int remote_idx = (idx + node_rank) % (NUM_OF_NODES - 1);
       const int actual_remote_node_rank = remote_idx < node_rank ? remote_idx : (remote_idx + 1);
       const int my_node_rank_in_remote = (node_rank < actual_remote_node_rank) ? node_rank : (node_rank - 1);
-      const size_t flag_offset = (my_node_rank_in_remote * NUM_OF_CHUNKS_PER_RANK + chunk_idx) * sizeof(uint64_t);
+      const size_t flag_offset = (my_node_rank_in_remote * MAX_NUM_OF_CHUNKS_PER_RANK + chunk_idx) * sizeof(uint64_t);
 
       // Quick density probe: check first warp-width of tokens.
       // On 4+ nodes, per-remote density is ~70%, so this almost always fails,
@@ -877,7 +882,13 @@ inline __device__ void N2N_warp_group_device_function(const int node_rank,
       }
 
       __syncwarp();
-      if (total_tokens > 0 && INTER_NODE_GROUP::thread_rank() == 0) {
+      // The signal must be sent UNCONDITIONALLY, once per (remote, chunk):
+      // the receiving G2S warp group waits for every chunk of its grid to
+      // reach expected_rdma_flag_value (which advances +1 per dispatch), even
+      // when the chunk routes zero tokens to it. Skipping the signal for
+      // empty chunks deadlocks the receiver. (Matches the DOCA path, which
+      // always posts the flag WQE.)
+      if (INTER_NODE_GROUP::thread_rank() == 0) {
         const unsigned channel_id = blockIdx.x % nixl_ctx->num_channels;
         nixlMemViewElem sig{nixl_ctx->remote_signal_mvh, (size_t)remote_idx, flag_offset};
         assert(nixlAtomicAdd<nixl_gpu_level_t::THREAD>(1, sig, channel_id, 0 /* NODELAY: flush all pending */) >= NIXL_SUCCESS);
@@ -1020,8 +1031,13 @@ inline __device__ void inter_node_N2N_warp_group_device_function(
     }
 
     __syncwarp();
-    if (total_tokens > 0 && INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
-      const size_t flag_offset = (my_node_rank_in_remote * NUM_OF_CHUNKS_PER_RANK + chunk_id) * sizeof(uint64_t);
+    // Signal unconditionally, once per (remote, chunk): the flag stride must
+    // be MAX-based to match the receiver's poll layout, and empty chunks must
+    // still advance the flag so the strict-equality expected-value protocol
+    // stays in sync across calls. (Matches the DOCA path.)
+    if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
+      constexpr int MAX_NUM_OF_CHUNKS_PER_RANK = (MAX_NUM_OF_TOKENS_PER_RANK - 1) / NUM_OF_TOKENS_PER_CHUNK + 1;
+      const size_t flag_offset = (my_node_rank_in_remote * MAX_NUM_OF_CHUNKS_PER_RANK + chunk_id) * sizeof(uint64_t);
       const unsigned channel_id = blockIdx.x % nixl_ctx->num_channels;
       nixlMemViewElem sig{nixl_ctx->remote_signal_mvh, (size_t)remote_idx, flag_offset};
       assert(nixlAtomicAdd<nixl_gpu_level_t::THREAD>(1, sig, channel_id, 0 /* NODELAY: flush all pending */) >= NIXL_SUCCESS);
@@ -3251,6 +3267,30 @@ inline __device__ void inter_node_G2S_warp_group_device_function(const int node_
     }
   }
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
+#ifdef USE_NIXL
+  // Drain: consume this round's flag for every in-grid (tile, chunk) the
+  // map-gated poll above never observed. Senders signal every chunk of their
+  // grid unconditionally, and NIXL has no completion barrier equivalent to
+  // DOCA's rdma_sync back-sync (whose same-QP ordering guarantees all flag
+  // atomics of a round have landed before the next round starts). Without
+  // this drain, an unobserved in-flight atomic from round r could land after
+  // a later round's residue store to the same slot (e.g. when the chunk grid
+  // shrinks between rounds) and permanently desync the strict-equality flag
+  // protocol.
+  for (int node_id = blockIdx.x; node_id < NUM_OF_NODES - 1; node_id += gridDim.x) {
+    for (int chunk_id = INTER_NODE_G2S_GROUP::thread_rank(); chunk_id < num_of_chunks_per_rank; chunk_id += INTER_NODE_G2S_GROUP::size()) {
+      const uint64_t* flag_location = rdma_inter_node_group_flags + (node_id * max_num_of_chunks_per_rank + chunk_id);
+      uint64_t rdma_flag = 0;
+      do{
+        rdma_flag = 0;
+        asm volatile("ld.relaxed.sys.global.b64 %0, [%1];"
+                     : "=l"(rdma_flag)
+                     : "l"(__cvta_generic_to_global(flag_location))
+                     : "memory");
+      }while(rdma_flag != *expected_flag_value);
+    }
+  }
+#endif // USE_NIXL
   // Update residue flags.
   int residue_flag_count = max_num_of_chunks_per_rank - num_of_chunks_per_rank;
   for (int node_id = blockIdx.x; node_id < NUM_OF_NODES - 1; node_id += gridDim.x) {

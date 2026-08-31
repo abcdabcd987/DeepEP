@@ -73,11 +73,12 @@ torch::Tensor Executor::allgather_routing_map(
 }
 
 HandleImpl Executor::metadata_preprocess_core(
-    HybridEpConfigInstance config, 
+    HybridEpConfigInstance config,
     hybrid_ep::tmp_state_t *preprocessing_tmp,
     hybrid_ep::tmp_state_t *preprocessing_local_experts_tmp,
     torch::Tensor global_routing_map,
     int64_t num_of_tokens_per_rank,
+    int64_t num_of_valid_tokens,
     int64_t num_permuted_tokens,
     int64_t pad_multiple,
     bool enable_permute,
@@ -106,6 +107,10 @@ HandleImpl Executor::metadata_preprocess_core(
   HandleImpl handle;
   handle.config = config;
   handle.num_of_tokens_per_rank = num_of_tokens_per_rank;
+  handle.num_of_valid_tokens = num_of_valid_tokens >= 0 ? num_of_valid_tokens : num_of_tokens_per_rank;
+  TORCH_CHECK(handle.num_of_valid_tokens <= num_of_tokens_per_rank,
+              "num_of_valid_tokens (", handle.num_of_valid_tokens,
+              ") must not exceed num_of_tokens_per_rank (", num_of_tokens_per_rank, ")");
   handle.num_permuted_tokens = num_permuted_tokens;
   handle.sparse_to_dense_map =
       torch::empty({num_of_tokens_per_rank * config.num_of_nodes,
@@ -212,10 +217,15 @@ void Executor::dispatch_preprocess(HybridEpConfigInstance config, DispatchArgs& 
             // sparse path) instead of one put per token. Same total bytes
             // as the `cudaMemcpyAsync` it replaces.
             const int prob_per_token = config.num_of_experts_per_rank * config.num_of_ranks_per_node;
+            // Restripe only the real rows of the user probs tensor. When ranks
+            // dispatch unequal counts, args.num_of_tokens_per_rank is the
+            // group-uniform slot count and may exceed probs.size(0); slots past
+            // the real rows are never sent (routing-map gated), so they can
+            // stay stale in the staging buffer.
             restripe_prob_for_nixl_dispatch(
                 static_cast<const float*>(args.probs.data_ptr()),
                 static_cast<float*>(inter_node_dispatch_buffers->attn_input_prob),
-                static_cast<int>(args.num_of_tokens_per_rank),
+                static_cast<int>(args.probs.size(0)),
                 static_cast<int>(config.max_num_of_tokens_per_rank),
                 static_cast<int>(config.num_of_nodes),
                 prob_per_token,

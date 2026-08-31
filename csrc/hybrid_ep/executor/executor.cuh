@@ -24,7 +24,17 @@ struct HandleImpl {
     torch::Tensor num_dispatched_tokens_tensor;
     torch::Tensor local_expert_routing_map;
     int64_t num_of_tokens_per_rank = -1;
+    // Number of real (valid) tokens on this rank. May be smaller than
+    // num_of_tokens_per_rank (the group-uniform token-slot count) when ranks
+    // dispatch unequal token counts; the trailing slots carry all-false /
+    // sentinel routing rows and never move data. -1 means "same as
+    // num_of_tokens_per_rank".
+    int64_t num_of_valid_tokens = -1;
     HybridEpConfigInstance config;
+
+    int64_t valid_token_count() const {
+        return num_of_valid_tokens >= 0 ? num_of_valid_tokens : num_of_tokens_per_rank;
+    }
 
     // Dense-layout metadata for permute/unpermute.
     torch::Tensor tokens_per_expert; 
@@ -108,6 +118,7 @@ public:
         hybrid_ep::tmp_state_t *preprocessing_local_experts_tmp,
         torch::Tensor global_routing_map,
         int64_t num_of_tokens_per_rank,
+        int64_t num_of_valid_tokens,
         int64_t num_permuted_tokens,
         int64_t pad_multiple,
         bool enable_permute,

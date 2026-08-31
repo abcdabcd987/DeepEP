@@ -146,30 +146,15 @@ handle = (
     attn_to_rdma_map,            # [2] Tensor
     num_dispatched_tokens_tensor,# [3] Tensor: Total dispatched token count
     local_expert_routing_map,    # [4] Tensor: Local expert routing information
-    num_of_tokens,               # [5] int: Number of tokens per rank
+    num_of_tokens,               # [5] int: Group-uniform token-slot count
     config,                      # [6] HybridEpConfigInstance: Runtime configuration
+    num_of_valid_tokens,         # [7] int: Real local token count (== hidden.size(0))
 )
 ```
 
-#### `dispatch_with_permute` Handle (independent permute)
+#### `dispatch_with_permute` Handle
 
-```python
-handle = (
-    sparse_to_dense_map,         # [0] Tensor
-    rdma_to_attn_map,            # [1] Tensor
-    attn_to_rdma_map,            # [2] Tensor
-    num_dispatched_tokens_tensor,# [3] Tensor: Total dispatched token count 
-    local_expert_routing_map,    # [4] Tensor: Local expert routing information
-    row_id_map,                  # [5] Tensor: Row permutation mapping for unpermute
-    num_of_tokens_per_rank,      # [6] int: Number of tokens per rank
-    config,                      # [7] HybridEpConfigInstance: Runtime configuration
-    overflow_flag,               # [8] Tensor: Buffer overflow indicator
-)
-```
-
-#### `dispatch_with_permute` Handle (fused permute)
-
-When `fuse_permute_dispatch=True`, `row_id_map` is replaced by fused-mode metadata:
+Both independent and fused permute modes produce the same layout:
 
 ```python
 handle = (
@@ -181,9 +166,10 @@ handle = (
     dense_chunk_layout,          # [5] Tensor: Per-chunk start positions in the per-rank buffer
     dense_to_expert_map,         # [6] Tensor: Token-to-local-expert mapping
     tokens_per_expert,           # [7] Tensor: Token count per local expert
-    num_of_tokens_per_rank,      # [8] int: Number of tokens per rank
+    num_of_tokens_per_rank,      # [8] int: Group-uniform token-slot count
     config,                      # [9] HybridEpConfigInstance: Runtime configuration
     overflow_flag,               # [10] Tensor: Buffer overflow indicator
+    num_of_valid_tokens,         # [11] int: Real local token count (== hidden.size(0))
 )
 ```
 
@@ -244,6 +230,23 @@ num_of_tokens_per_rank <= max_num_of_tokens_per_rank
 ```
 
 Since `max_num_of_tokens_per_rank` also determines buffer allocation size, Hybrid-EP automatically updates this value on each run to ensure sufficient capacity
+
+### Unequal per-rank token counts
+
+Ranks may dispatch different numbers of tokens. Every rank passes the same
+group-uniform token-slot count via the `num_of_tokens_per_rank` argument of
+`dispatch` / `dispatch_with_permute` (any agreed value that upper-bounds every
+rank's local count, e.g. the group max; it is rounded up to a multiple of 16
+internally). Each rank's `hidden` / `probs` / `topk_idx` / `routing_map` keep
+their real local row count `N_i <= num_of_tokens_per_rank`. Internally, only
+the routing tensor is padded with routed-nowhere rows (all-`False` map rows in
+sparse mode, all-`-1` sentinel rows in dense top-k mode) before the routing-map
+all-gather; padded slots produce no NVLink/RDMA traffic and no expert GEMM
+rows. The combine outputs are returned with exactly `N_i` rows. When
+`num_of_tokens_per_rank` is omitted, it defaults to `hidden.size(0)` and all
+ranks must dispatch equal counts, matching the previous behavior. The
+per-call value must be identical on every rank of the group (it defines the
+shared metadata layout and chunk grid); values may vary freely across calls.
 
 ---
 
