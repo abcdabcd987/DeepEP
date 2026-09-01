@@ -128,6 +128,7 @@ bool HybridEPBuffer::update_buffer(HybridEpConfigInstance config) {
     allgather_obj.update_config(buffer_config);
     release_buffer();
     allocate_buffer();
+    buffer_generation++;
   }
   return need_reallocate;
 }
@@ -136,6 +137,10 @@ HandleImpl HybridEPBuffer::metadata_preprocessing(HybridEpConfigInstance config,
   // Basic checks
   assert(local_routing_map.device().is_cuda());
   assert(local_routing_map.is_contiguous());
+  // Unreachable through the Python wrapper (which pads the routing data first),
+  // but metadata_preprocessing is a public pybind entry point: a direct caller
+  // passing mismatched rows would otherwise get silently corrupt metadata (the
+  // allgather sizes from the tensor, the scan from the scalar).
   TORCH_CHECK(local_routing_map.size(0) == num_of_tokens_per_rank,
               "local_routing_map has ", local_routing_map.size(0),
               " rows but num_of_tokens_per_rank is ", num_of_tokens_per_rank,

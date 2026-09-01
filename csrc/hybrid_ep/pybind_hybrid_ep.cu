@@ -123,6 +123,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &HybridEpConfigInstance::backward_combine_api)
         .def_readwrite("device_side_sync_combine_api",
                        &HybridEpConfigInstance::device_side_sync_combine_api)
+        .def_readwrite("buffer_generation", &HybridEpConfigInstance::buffer_generation)
         .def("is_valid", &HybridEpConfigInstance::is_valid, py::arg("fuse_permute_dispatch") = false)
         .def("__repr__", [](const HybridEpConfigInstance &config) {
           return "<HybridEpConfigInstance hidden_dim=" +
@@ -182,6 +183,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("load_cached_kernels") = false,
             py::arg("use_shared_buffer") = true,
             py::arg("enable_custom_allgather") = true)
+        .def_readonly("buffer_generation", &HybridEPBuffer::buffer_generation)
         .def("update_buffer", &HybridEPBuffer::update_buffer, py::arg("config"))
         .def("metadata_preprocessing", &HybridEPBuffer::metadata_preprocessing,
              py::kw_only(),

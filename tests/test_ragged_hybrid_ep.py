@@ -464,6 +464,66 @@ def test_uniform_unaligned_default(buffer: deep_ep.HybridEPBuffer, ref: TorchRef
         print("  uniform unaligned default: PASS", flush=True)
 
 
+def test_stale_handle_rejected(buffer: deep_ep.HybridEPBuffer, ref: TorchRef):
+    """Buffer growth reallocates the communication buffers and resets the flag
+    protocol; replaying a handle created before the growth must fail loudly.
+    Must run last: it grows the shared buffer (collective realloc + JIT)."""
+    rank = dist.get_rank()
+    num_valid, (hidden, probs, scaling_factor, routing_map, _ti, _tw, _) = (
+        make_ragged_inputs(rank, use_fp8=False, num_valid=256)
+    )
+    if rank == 0:
+        print("\n=== Stale handle rejection after buffer growth ===", flush=True)
+
+    disp, _disp_probs, _sf, handle = buffer.dispatch(
+        hidden=hidden,
+        scaling_factor=scaling_factor,
+        routing_map=routing_map,
+        probs=probs,
+        num_of_tokens_per_rank=MAX_NUM_OF_TOKENS_PER_RANK,
+    )
+
+    # Grow the buffer: a slot count above the current capacity triggers a
+    # collective reallocation (and JIT recompile) on every rank.
+    disp2, disp_probs2, _sf2, handle2 = buffer.dispatch(
+        hidden=hidden,
+        scaling_factor=scaling_factor,
+        routing_map=routing_map,
+        probs=probs,
+        num_of_tokens_per_rank=MAX_NUM_OF_TOKENS_PER_RANK + 512,
+    )
+
+    # The pre-growth handle must be rejected on the cached-handle paths.
+    for op in (
+        lambda: buffer.combine(disp.to(torch.bfloat16), None, handle),
+        lambda: buffer.dispatch(
+            hidden=hidden, scaling_factor=scaling_factor,
+            routing_map=routing_map, probs=probs, handle=handle,
+        ),
+    ):
+        try:
+            op()
+        except RuntimeError as e:
+            assert "generation" in str(e), f"unexpected error: {e}"
+        else:
+            raise AssertionError("stale pre-growth handle was not rejected")
+
+    # The post-growth handle still works end to end.
+    num_dispatched, lerm = handle2[3], handle2[4]
+    num_dispatched = int(num_dispatched.cpu().item())
+    copy_times = lerm[:num_dispatched].sum(dim=1)
+    start, end = ref._local_expert_range_per_node()
+    masked = torch.zeros_like(disp_probs2)
+    masked[:, start:end] = disp_probs2[:, start:end]
+    combined, _combined_probs = buffer.combine(
+        disp2.to(torch.bfloat16) * copy_times.unsqueeze(1), masked, handle2
+    )
+    check_combined("Post-growth combine hidden", combined, hidden, routing_map, "")
+    dist.barrier()
+    if rank == 0:
+        print("  stale handle rejected: PASS", flush=True)
+
+
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
@@ -499,6 +559,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             test_zero_token_rank(buffer, ref, use_fp8)
             if not use_fp8:
                 test_uniform_unaligned_default(buffer, ref)
+                test_stale_handle_rejected(buffer, ref)
     dist.barrier()
     if dist.get_rank() == 0:
         print("\nAll ragged HybridEP tests PASSED", flush=True)

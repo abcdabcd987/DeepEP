@@ -159,6 +159,15 @@ struct HybridEpConfigInstance {
   bool device_side_sync_combine_api = true;
 
   /*
+   *  Buffer incarnation this config (and any handle carrying it) was created
+   *  against. Every buffer reallocation bumps HybridEPBuffer::buffer_generation;
+   *  the Python wrapper stamps it here so replaying a handle created before a
+   *  reallocation can be rejected instead of corrupting the flag protocol.
+   *  Not a kernel template parameter.
+   */
+  int64_t buffer_generation = -1;
+
+  /*
    *  Validation check
    */
   bool is_valid(bool fuse_permute_dispatch = false){

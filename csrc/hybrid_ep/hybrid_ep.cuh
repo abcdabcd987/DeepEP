@@ -26,6 +26,11 @@ public:
   ~HybridEPBuffer();
   bool update_buffer(HybridEpConfigInstance config); // True means the buffer is reallocated.
 
+  // Incremented on every buffer reallocation. Handles record the generation
+  // they were created against (via HybridEpConfigInstance::buffer_generation)
+  // so stale-handle replay can be rejected.
+  int64_t buffer_generation = 0;
+
   HandleImpl metadata_preprocessing(HybridEpConfigInstance config,
     torch::Tensor local_routing_map,
     int64_t num_of_tokens_per_rank,
