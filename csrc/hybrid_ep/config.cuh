@@ -160,12 +160,13 @@ struct HybridEpConfigInstance {
 
   /*
    *  Buffer incarnation this config (and any handle carrying it) was created
-   *  against. Every buffer reallocation bumps HybridEPBuffer::buffer_generation;
-   *  the Python wrapper stamps it here so replaying a handle created before a
-   *  reallocation can be rejected instead of corrupting the flag protocol.
-   *  Not a kernel template parameter.
+   *  against. Every buffer reallocation bumps HybridEPBuffer::buffer_generation
+   *  (which starts at 1); the Python wrapper stamps it here so replaying a
+   *  handle created before a reallocation can be rejected instead of
+   *  corrupting the flag protocol. 0 means "never stamped" and matches no
+   *  live buffer. Not a kernel template parameter.
    */
-  int64_t buffer_generation = -1;
+  uint64_t buffer_generation = 0;
 
   /*
    *  Validation check

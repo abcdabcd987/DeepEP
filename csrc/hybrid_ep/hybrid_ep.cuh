@@ -28,8 +28,9 @@ public:
 
   // Incremented on every buffer reallocation. Handles record the generation
   // they were created against (via HybridEpConfigInstance::buffer_generation)
-  // so stale-handle replay can be rejected.
-  int64_t buffer_generation = 0;
+  // so stale-handle replay can be rejected. Starts at 1 so a config that was
+  // never stamped (generation 0) can never match a live buffer.
+  uint64_t buffer_generation = 1;
 
   HandleImpl metadata_preprocessing(HybridEpConfigInstance config,
     torch::Tensor local_routing_map,
