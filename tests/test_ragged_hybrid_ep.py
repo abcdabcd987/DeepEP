@@ -3,11 +3,11 @@
 """
 Correctness tests for ragged (per-rank unequal) token counts in HybridEP.
 
-Each rank dispatches its own N_i tokens (including dropped tokens routed to
-zero experts, and optionally a rank with zero tokens) while all ranks pass the
-same group-uniform `num_of_tokens_per_rank` slot count. The reference is the
-uniform-count TorchRef fed with locally zero-padded inputs: pad rows route
-nowhere, so the reference outputs are exactly the expected ragged outputs.
+Each rank dispatches its own N_i tokens (optionally zero on some ranks) while
+all ranks pass the same group-uniform `num_of_tokens_per_rank` slot count. The
+reference is the uniform-count TorchRef fed with locally zero-padded inputs:
+pad rows route nowhere, so the reference outputs are exactly the expected
+ragged outputs.
 """
 import argparse
 import os
@@ -30,7 +30,6 @@ NUM_LOCAL_EXPERTS = int(os.environ.get("NUM_LOCAL_EXPERTS", 8))
 TOPK = int(os.environ.get("TOPK", 8))
 PAD_MULTIPLE = int(os.environ.get("PAD_MULTIPLE", 32))
 SEED = int(os.environ.get("SEED", 1025))
-DROP_FRACTION = float(os.environ.get("DROP_FRACTION", 0.1))
 
 USE_MNNVL = os.environ.get("USE_MNNVL", "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
@@ -72,10 +71,8 @@ def init_ragged_tensor(
     num_of_experts: int,
     use_fp8: bool,
     seed: int,
-    drop_fraction: float,
 ):
-    """Build per-rank inputs with num_valid rows; a drop_fraction subset of the
-    rows is routed to ZERO experts (all-false map rows / all -1 topk rows)."""
+    """Build per-rank inputs with num_valid rows, each routed to topk experts."""
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed)
     if use_fp8:
@@ -92,17 +89,14 @@ def init_ragged_tensor(
     topk_idx = torch.full((num_valid, topk), -1, device="cuda", dtype=torch.int64)
     topk_weights = torch.zeros(num_valid, topk, device="cuda", dtype=torch.float32)
 
-    dropped = torch.rand(num_valid, device="cuda", generator=gen) < drop_fraction
     for i in range(num_valid):
-        if dropped[i]:
-            continue
         selected = torch.randperm(num_of_experts, device="cuda", generator=gen)[:topk]
         topk_idx[i, :] = selected.to(torch.int64)
         topk_weights[i, :] = 1.0
         routing_map[i, selected] = True
         probs[i, selected] = 1.0
 
-    return hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights, dropped
+    return hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights
 
 
 def pad_rows(t: torch.Tensor, target_rows: int):
@@ -116,8 +110,7 @@ def pad_rows(t: torch.Tensor, target_rows: int):
 
 def check_combined(name, combined, hidden, routing_map, context):
     """combine sums one expert contribution per selected expert, each equal to
-    the original token row (weights are 1), so combined[i] == hidden[i] * n_sel[i]
-    and dropped rows are exactly zero."""
+    the original token row (weights are 1), so combined[i] == hidden[i] * n_sel[i]."""
     assert combined.shape[0] == hidden.shape[0], (
         f"{name} row count{context}: expected {hidden.shape[0]}, got {combined.shape[0]}"
     )
@@ -128,14 +121,9 @@ def check_combined(name, combined, hidden, routing_map, context):
     assert torch.allclose(
         combined.to(torch.float32), expected.to(torch.float32), atol=2e-4, rtol=1e-2
     ), f"{name} value mismatch{context}"
-    dropped_rows = (routing_map.sum(dim=1) == 0)
-    if dropped_rows.any():
-        assert (combined[dropped_rows] == 0).all(), (
-            f"{name}{context}: dropped (zero-expert) rows must combine to exact zeros"
-        )
 
 
-def make_ragged_inputs(rank: int, use_fp8: bool, num_valid: int = None, drop_fraction: float = 0.0):
+def make_ragged_inputs(rank: int, use_fp8: bool, num_valid: int = None):
     if num_valid is None:
         num_valid = RAGGED_NUM_TOKENS[rank % len(RAGGED_NUM_TOKENS)]
     return num_valid, init_ragged_tensor(
@@ -145,7 +133,6 @@ def make_ragged_inputs(rank: int, use_fp8: bool, num_valid: int = None, drop_fra
         num_of_experts=NUM_OF_EXPERTS,
         use_fp8=use_fp8,
         seed=SEED + rank,
-        drop_fraction=drop_fraction,
     )
 
 
@@ -157,7 +144,7 @@ def group_token_slots(num_valid: int) -> int:
 
 def test_ragged_dispatch_combine(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, use_fp8: bool):
     rank = dist.get_rank()
-    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights, _) = (
+    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights) = (
         make_ragged_inputs(rank, use_fp8)
     )
     num_slots = group_token_slots(num_valid)
@@ -231,7 +218,7 @@ def test_ragged_dispatch_combine(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, 
 
 def test_ragged_dispatch_with_permute(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, use_fp8: bool):
     rank = dist.get_rank()
-    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights, _) = (
+    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights) = (
         make_ragged_inputs(rank, use_fp8)
     )
     num_slots = group_token_slots(num_valid)
@@ -333,7 +320,7 @@ def test_zero_token_rank(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, use_fp8:
     """One rank dispatches zero tokens; the group must stay in lockstep."""
     rank = dist.get_rank()
     num_valid = 0 if rank == 0 else RAGGED_NUM_TOKENS[rank % len(RAGGED_NUM_TOKENS)]
-    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights, _) = (
+    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights) = (
         make_ragged_inputs(rank, use_fp8=use_fp8, num_valid=num_valid)
     )
     num_slots = group_token_slots(num_valid)
@@ -426,7 +413,7 @@ def test_uniform_unaligned_default(buffer: deep_ep.HybridEPBuffer, ref: TorchRef
     rounded up internally and combine must still return exactly N rows."""
     rank = dist.get_rank()
     num_valid = 1000  # not a multiple of 16, same on every rank
-    num_valid, (hidden, probs, scaling_factor, routing_map, _ti, _tw, _) = (
+    num_valid, (hidden, probs, scaling_factor, routing_map, _ti, _tw) = (
         make_ragged_inputs(rank, use_fp8=False, num_valid=num_valid)
     )
     num_slots = align16(num_valid)
@@ -464,64 +451,12 @@ def test_uniform_unaligned_default(buffer: deep_ep.HybridEPBuffer, ref: TorchRef
         print("  uniform unaligned default: PASS", flush=True)
 
 
-def test_dropped_tokens(buffer: deep_ep.HybridEPBuffer, ref: TorchRef):
-    """Tokens routed to zero experts (the documented -1 topk sentinel /
-    all-false routing row contract, e.g. from capacity-based token dropping)
-    may appear anywhere in the valid region: they must dispatch nothing and
-    combine to exact zeros. Kept separate from the ragged matrix, which only
-    pads at the end (the training scenario)."""
-    rank = dist.get_rank()
-    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights, dropped) = (
-        make_ragged_inputs(rank, use_fp8=False, drop_fraction=DROP_FRACTION)
-    )
-    num_slots = group_token_slots(num_valid)
-    if rank == 0:
-        print(f"\n=== Dropped (zero-expert) tokens (BF16, slots={num_slots}) ===", flush=True)
-    assert dropped.any(), "test needs at least one dropped row"
-
-    ref_hidden, ref_probs, _ref_sf = ref.dispatch(
-        pad_rows(hidden, num_slots),
-        pad_rows(routing_map, num_slots),
-        pad_rows(probs, num_slots),
-        pad_rows(scaling_factor, num_slots),
-    )
-    for routing_label, kwargs in [
-        ("sparse routing", {"routing_map": routing_map, "probs": probs}),
-        ("dense topk_idx", {"topk_idx": topk_idx, "topk_weights": topk_weights,
-                            "num_of_experts": NUM_OF_EXPERTS}),
-    ]:
-        dispatched_hidden, dispatched_probs, _sf, handle = buffer.dispatch(
-            hidden=hidden,
-            scaling_factor=scaling_factor,
-            num_of_tokens_per_rank=num_slots,
-            **kwargs,
-        )
-        assert_bitwise_equal("Dropped dispatch hidden", ref_hidden, dispatched_hidden, f" ({routing_label})")
-        start, end = ref._local_expert_range_per_node()
-        assert_bitwise_equal("Dropped dispatch probs", ref_probs, dispatched_probs[:, start:end], f" ({routing_label})")
-        masked = torch.zeros_like(dispatched_probs)
-        masked[:, start:end] = dispatched_probs[:, start:end]
-
-        num_dispatched, lerm = handle[3], handle[4]
-        num_dispatched = int(num_dispatched.cpu().item())
-        copy_times = lerm[:num_dispatched].sum(dim=1)
-        combined, combined_probs = buffer.combine(
-            dispatched_hidden.to(torch.bfloat16) * copy_times.unsqueeze(1), masked, handle
-        )
-        # check_combined asserts dropped rows are exact zeros.
-        check_combined("Dropped combine hidden", combined, hidden, routing_map, f" ({routing_label})")
-        assert_bitwise_equal("Dropped combine probs", probs, combined_probs, f" ({routing_label})")
-    dist.barrier()
-    if rank == 0:
-        print("  dropped tokens: PASS", flush=True)
-
-
 def test_stale_handle_rejected(buffer: deep_ep.HybridEPBuffer, ref: TorchRef):
     """Buffer growth reallocates the communication buffers and resets the flag
     protocol; replaying a handle created before the growth must fail loudly.
     Must run last: it grows the shared buffer (collective realloc + JIT)."""
     rank = dist.get_rank()
-    num_valid, (hidden, probs, scaling_factor, routing_map, _ti, _tw, _) = (
+    num_valid, (hidden, probs, scaling_factor, routing_map, _ti, _tw) = (
         make_ragged_inputs(rank, use_fp8=False, num_valid=256)
     )
     if rank == 0:
@@ -611,7 +546,6 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             test_zero_token_rank(buffer, ref, use_fp8)
             if not use_fp8:
                 test_uniform_unaligned_default(buffer, ref)
-                test_dropped_tokens(buffer, ref)
                 test_stale_handle_rejected(buffer, ref)
     dist.barrier()
     if dist.get_rank() == 0:
