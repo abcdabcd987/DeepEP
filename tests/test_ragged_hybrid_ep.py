@@ -135,7 +135,7 @@ def check_combined(name, combined, hidden, routing_map, context):
         )
 
 
-def make_ragged_inputs(rank: int, use_fp8: bool, num_valid: int = None):
+def make_ragged_inputs(rank: int, use_fp8: bool, num_valid: int = None, drop_fraction: float = 0.0):
     if num_valid is None:
         num_valid = RAGGED_NUM_TOKENS[rank % len(RAGGED_NUM_TOKENS)]
     return num_valid, init_ragged_tensor(
@@ -145,7 +145,7 @@ def make_ragged_inputs(rank: int, use_fp8: bool, num_valid: int = None):
         num_of_experts=NUM_OF_EXPERTS,
         use_fp8=use_fp8,
         seed=SEED + rank,
-        drop_fraction=DROP_FRACTION,
+        drop_fraction=drop_fraction,
     )
 
 
@@ -464,6 +464,58 @@ def test_uniform_unaligned_default(buffer: deep_ep.HybridEPBuffer, ref: TorchRef
         print("  uniform unaligned default: PASS", flush=True)
 
 
+def test_dropped_tokens(buffer: deep_ep.HybridEPBuffer, ref: TorchRef):
+    """Tokens routed to zero experts (the documented -1 topk sentinel /
+    all-false routing row contract, e.g. from capacity-based token dropping)
+    may appear anywhere in the valid region: they must dispatch nothing and
+    combine to exact zeros. Kept separate from the ragged matrix, which only
+    pads at the end (the training scenario)."""
+    rank = dist.get_rank()
+    num_valid, (hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights, dropped) = (
+        make_ragged_inputs(rank, use_fp8=False, drop_fraction=DROP_FRACTION)
+    )
+    num_slots = group_token_slots(num_valid)
+    if rank == 0:
+        print(f"\n=== Dropped (zero-expert) tokens (BF16, slots={num_slots}) ===", flush=True)
+    assert dropped.any(), "test needs at least one dropped row"
+
+    ref_hidden, ref_probs, _ref_sf = ref.dispatch(
+        pad_rows(hidden, num_slots),
+        pad_rows(routing_map, num_slots),
+        pad_rows(probs, num_slots),
+        pad_rows(scaling_factor, num_slots),
+    )
+    for routing_label, kwargs in [
+        ("sparse routing", {"routing_map": routing_map, "probs": probs}),
+        ("dense topk_idx", {"topk_idx": topk_idx, "topk_weights": topk_weights,
+                            "num_of_experts": NUM_OF_EXPERTS}),
+    ]:
+        dispatched_hidden, dispatched_probs, _sf, handle = buffer.dispatch(
+            hidden=hidden,
+            scaling_factor=scaling_factor,
+            num_of_tokens_per_rank=num_slots,
+            **kwargs,
+        )
+        assert_bitwise_equal("Dropped dispatch hidden", ref_hidden, dispatched_hidden, f" ({routing_label})")
+        start, end = ref._local_expert_range_per_node()
+        assert_bitwise_equal("Dropped dispatch probs", ref_probs, dispatched_probs[:, start:end], f" ({routing_label})")
+        masked = torch.zeros_like(dispatched_probs)
+        masked[:, start:end] = dispatched_probs[:, start:end]
+
+        num_dispatched, lerm = handle[3], handle[4]
+        num_dispatched = int(num_dispatched.cpu().item())
+        copy_times = lerm[:num_dispatched].sum(dim=1)
+        combined, combined_probs = buffer.combine(
+            dispatched_hidden.to(torch.bfloat16) * copy_times.unsqueeze(1), masked, handle
+        )
+        # check_combined asserts dropped rows are exact zeros.
+        check_combined("Dropped combine hidden", combined, hidden, routing_map, f" ({routing_label})")
+        assert_bitwise_equal("Dropped combine probs", probs, combined_probs, f" ({routing_label})")
+    dist.barrier()
+    if rank == 0:
+        print("  dropped tokens: PASS", flush=True)
+
+
 def test_stale_handle_rejected(buffer: deep_ep.HybridEPBuffer, ref: TorchRef):
     """Buffer growth reallocates the communication buffers and resets the flag
     protocol; replaying a handle created before the growth must fail loudly.
@@ -559,6 +611,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             test_zero_token_rank(buffer, ref, use_fp8)
             if not use_fp8:
                 test_uniform_unaligned_default(buffer, ref)
+                test_dropped_tokens(buffer, ref)
                 test_stale_handle_rejected(buffer, ref)
     dist.barrier()
     if dist.get_rank() == 0:
